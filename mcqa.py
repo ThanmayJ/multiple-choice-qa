@@ -90,12 +90,9 @@ def get_ddp_loader(rank, world_size, batch_size, model_type):
     else:
         SWAGDataset = SequenceClassificationDataset
     
-    train_set = SWAGDataset(swag["train"].select(range(100)), tokenizer)
-    valid_set = SWAGDataset(swag["validation"].select(range(10)), tokenizer)
-    test_set = SWAGDataset(swag["test"].select(range(10)), tokenizer)
-    # train_set = SWAGDataset(swag["train"], tokenizer)
-    # valid_set = SWAGDataset(swag["validation"], tokenizer)
-    # test_set = SWAGDataset(swag["test"], tokenizer)
+    train_set = SWAGDataset(swag["train"], tokenizer)
+    valid_set = SWAGDataset(swag["validation"], tokenizer)
+    test_set = SWAGDataset(swag["test"], tokenizer)
     
     train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     valid_sampler = DistributedSampler(valid_set, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
