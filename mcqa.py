@@ -10,7 +10,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 
-from transformers import AutoTokenizer, AutoModelForMultipleChoice
+from transformers import AutoTokenizer, AutoModelForMultipleChoice, AutoModelForSequenceClassification
 
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -29,7 +29,7 @@ swag = load_dataset("swag", "regular")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-class SWAGDataset(Dataset):
+class MultipleChoiceDataset(Dataset):
     def __init__(self, data, tokenizer, max_len=256):
         self.tokenizer = tokenizer
         self.data = data
@@ -52,9 +52,44 @@ class SWAGDataset(Dataset):
         return {'source_ids': source.input_ids.to(dtype=torch.long),
                 'source_masks': source.attention_mask.to(dtype=torch.long),
                 'label': label}
+    
+class SequenceClassificationDataset(Dataset):
+    def __init__(self, data, tokenizer, max_len=256):
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.data = {'sentence':[], 'label':[]}
+        for idx in range(len(data)):
+            sent1 = data[idx]["sent1"]
+            sent2 = data[idx]["sent2"]
+            label = data[idx]["label"]
+            sentences = [sent1]*4
+            labels = [0,0,0,0]
+            labels[label] = 1
+            for i in range(4):
+                endingi = f'ending{i}'
+                sentences[i] = f"{sentences[i]} {sent2} {data[idx][endingi]}"
+            self.data['sentence'].extend(sentences)
+            self.data['label'].extend(labels)
+    
+    def __len__(self):
+        return len(self.data['label'])
+    
+    def __getitem__(self, idx):
+        sentence = self.data['sentence'][idx]
+        label = self.data['label'][idx]
+        source = self.tokenizer(sentence, max_length=self.max_len, pad_to_max_length=True, truncation=True, padding="max_length", return_tensors='pt') # shape [max_len]
+        
+        return {'source_ids':source.input_ids.squeeze(0).to(dtype=torch.long),
+                'source_masks':source.attention_mask.squeeze(0).to(dtype=torch.long),
+                'label':label}
 
 
-def get_ddp_loader(rank, world_size, batch_size):
+def get_ddp_loader(rank, world_size, batch_size, model_type):
+    if model_type == "MultipleChoice":
+        SWAGDataset = MultipleChoiceDataset
+    else:
+        SWAGDataset = SequenceClassificationDataset
+    
     train_set = SWAGDataset(swag["train"].select(range(100)), tokenizer)
     valid_set = SWAGDataset(swag["validation"].select(range(10)), tokenizer)
     test_set = SWAGDataset(swag["test"].select(range(10)), tokenizer)
@@ -73,21 +108,24 @@ def get_ddp_loader(rank, world_size, batch_size):
     dataloader = {"train":train_loader, "valid":valid_loader, "test":test_loader}
     return dataloader
 
+TEAMLoss = torch.nn.CrossEntropyLoss()
 
-def train(rank, epoch, tokenizer, model, device, loader, optimizer):
+def train(rank, epoch, tokenizer, model, device, loader, optimizer, model_type):
     model.train()
     epoch_loss = 0
     loader.sampler.set_epoch(epoch)    
     for _, data in enumerate(loader):
         optimizer.zero_grad()
-        src = data["source_ids"].to(rank)  # shape (BATCH_SIZE, 4, MAX_LEN)
-        # shape (BATCH_SIZE, 4, MAX_LEN)
-        mask = data["source_masks"].to(rank)
+        src = data["source_ids"].to(rank)  # shape (BATCH_SIZE, 4, MAX_LEN) or (BATCH_SIZE, MAX_LEN)
+        mask = data["source_masks"].to(rank)   # shape (BATCH_SIZE, 4, MAX_LEN) or (BATCH_SIZE, MAX_LEN)
         label = data["label"].to(rank)  # shape (BATCH_SIZE)
 
-        outputs = model(input_ids=src, attention_mask=mask, labels=label)
-
-        loss = outputs[0]
+        if model_type=="MultipleChoice":
+            outputs = model(input_ids=src, attention_mask=mask, labels=label)
+            loss = outputs[0]
+        else:
+            outputs = model(input_ids=src,attention_mask=mask)
+            loss = TEAMLoss(outputs.logits, label)
 
         if _ % 10 == 0 and rank==0:
             print(f"Epoch {epoch} | Step {_} | Loss {loss}")
@@ -98,27 +136,31 @@ def train(rank, epoch, tokenizer, model, device, loader, optimizer):
     return epoch_loss/len(loader)
 
 
-def validate(rank, epoch, tokenizer, model, device, loader):
+def validate(rank, epoch, tokenizer, model, device, loader, model_type):
     model.eval()
     epoch_loss = 0
     loader.sampler.set_epoch(epoch)    
     with torch.no_grad():
         for _, data in enumerate(loader):
-            # shape (BATCH_SIZE, 4, MAX_LEN)
-            src = data["source_ids"].to(rank)
-            # shape (BATCH_SIZE, 4, MAX_LEN)
-            mask = data["source_masks"].to(rank)
+            src = data["source_ids"].to(rank)    # shape (BATCH_SIZE, 4, MAX_LEN) or (BATCH_SIZE, MAX_LEN)
+            mask = data["source_masks"].to(rank)     # shape (BATCH_SIZE, 4, MAX_LEN) or (BATCH_SIZE, MAX_LEN)
             label = data["label"].to(rank)  # shape (BATCH_SIZE)
 
             outputs = model(input_ids=src, attention_mask=mask, labels=label)
 
-            loss = outputs[0]
+            if model_type=="MultipleChoice":
+                outputs = model(input_ids=src, attention_mask=mask, labels=label)
+                loss = outputs[0]
+            else:
+                outputs = model(input_ids=src,attention_mask=mask)
+                loss = TEAMLoss(outputs.logits, label)
 
             if _ % 10 == 0 and rank==0:
                 print(f"Epoch {epoch} | Step {_} | Loss {loss}")
 
             epoch_loss += loss
     return epoch_loss/len(loader)
+
 
 def do_gather(rank, world_size, data):
     if rank == 0:
@@ -130,7 +172,8 @@ def do_gather(rank, world_size, data):
         dist.gather(tensor=data, gather_list=[], group=dist.group.WORLD)
         return []
 
-def test(rank, world_size, epoch, tokenizer, model, device, loader):
+
+def test(rank, world_size, epoch, tokenizer, model, device, loader, model_type):
     model.eval()
     epoch_loss = 0
     references = []
@@ -138,9 +181,8 @@ def test(rank, world_size, epoch, tokenizer, model, device, loader):
     loader.sampler.set_epoch(epoch)    
     with torch.no_grad():
         for _, data in enumerate(loader):
-            src = data["source_ids"].to(rank)  # shape (BATCH_SIZE, MAX_LEN)
-            # shape (BATCH_SIZE, MAX_LEN)
-            mask = data["source_masks"].to(rank)
+            src = data["source_ids"].to(rank)  # shape (BATCH_SIZE, MAX_LEN) or (BATCH_SIZE, MAX_LEN)
+            mask = data["source_masks"].to(rank)        # shape (BATCH_SIZE, MAX_LEN) or (BATCH_SIZE, MAX_LEN)
             label = data["label"].to(rank)  # shape (BATCH_SIZE)
 
             outputs = model(input_ids=src, attention_mask=mask, labels=label)
@@ -148,7 +190,20 @@ def test(rank, world_size, epoch, tokenizer, model, device, loader):
             loss = outputs[0]
             logits = outputs[1]
 
-            pred_label = torch.argmax(torch.softmax(logits, dim=-1), dim=-1)
+            if model_type=="MultipleChoice":
+                outputs = model(input_ids=src, attention_mask=mask, labels=label)
+                loss = outputs[0]
+                logits = outputs[1]
+                pred_label = torch.argmax(torch.softmax(logits, dim=-1), dim=-1)
+            else:
+                outputs = model(input_ids=src,attention_mask=mask)
+                logits = outputs.logits
+                loss = TEAMLoss(logits, label)
+
+                positive_score = logits[:, 1]
+                print(positive_score.shape)
+                pred_label = torch.argmax(positive_score.reshape(-1, 4),dim=-1)
+                label =  label.reshape(-1,4).argmax(1)
 
             predictions.extend(pred_label.tolist())
             references.extend(label.tolist())
@@ -157,6 +212,7 @@ def test(rank, world_size, epoch, tokenizer, model, device, loader):
                 print(f"Epoch {epoch} | Step {_} | Loss {loss}")
 
             epoch_loss += loss
+    
     # print(f"Rank {rank} has {len(predictions)} predictions and {len(references)} references")
     predictions = torch.tensor(predictions,dtype=torch.int8).to(rank)
     references = torch.tensor(references,dtype=torch.int8).to(rank)
@@ -176,6 +232,7 @@ def test(rank, world_size, epoch, tokenizer, model, device, loader):
     
     if(rank==0):
         print("Gathered all predictions and references. Evaluating...")
+    
     # Evaluation
     predictions_list = [x.item() for y in gather_predictions for x in y]
     references_list = [x.item() for y in gather_references for x in y]
@@ -197,8 +254,12 @@ def main(rank, args):
     world_size = args.gpus
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     #####
-    dataloader = get_ddp_loader(rank, world_size, args.batch_size)
-    model = AutoModelForMultipleChoice.from_pretrained(MODEL_NAME).to(rank)
+    dataloader = get_ddp_loader(rank, world_size, args.batch_size, args.model_type)
+    if args.model_type=="MultipleChoice":
+        model = AutoModelForMultipleChoice.from_pretrained(MODEL_NAME).to(rank)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME,num_labels=2).to(rank)
+    
     model = DDP(model, device_ids=[rank], output_device=rank)
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.lr)
     
@@ -213,12 +274,11 @@ def main(rank, args):
         start_time = time.time()
         if(rank==0):
             print("\nTraining...")
-        train_loss = train(rank, epoch, tokenizer, model,
-                          device, dataloader["train"], optimizer)
+        train_loss = train(rank, epoch, tokenizer, model, device, dataloader["train"], optimizer, args.model_type)
         end_time = time.time()
         if(rank==0):
             print("\nValidating...")
-        valid_loss = validate(rank, epoch, tokenizer, model, device, dataloader["valid"])
+        valid_loss = validate(rank, epoch, tokenizer, model, device, dataloader["valid"], args.model_type)
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
 
         train_losses.append(train_loss)
@@ -244,7 +304,7 @@ def main(rank, args):
     checkpoint_dict = torch.load(MODEL_PATH, map_location=map_location)
     model.load_state_dict(checkpoint_dict['model'])
     optimizer.load_state_dict(checkpoint_dict['optimizer'])
-    accuracy, test_loss = test(rank, world_size, epoch, tokenizer, model, device, dataloader["valid"])
+    accuracy, test_loss = test(rank, world_size, epoch, tokenizer, model, device, dataloader["valid"], args.model_type)
     if rank==0:
         print(f"Accuracy: {accuracy} | Test Loss: {test_loss}")
         print(f"Training time took {train_mins}m {train_secs}s")
@@ -270,6 +330,8 @@ if __name__ == '__main__':
                         help='Number of training epochs')
     parser.add_argument('--lr', default=1e-5, type=int, 
                         help='Learning rate for AdamW optimizer')
+    parser.add_argument('--model_type', default="MultipleChoice",type=str,
+                        help='Type of MCQA model: MultipleChoice or SequenceClassification')
     
     args = parser.parse_args()
     os.environ['MASTER_ADDR'] = args.ipaddr
