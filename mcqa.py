@@ -1,4 +1,7 @@
 import os
+import argparse
+
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 
 import evaluate
 import time
@@ -51,13 +54,13 @@ class SWAGDataset(Dataset):
                 'label': label}
 
 
-def get_ddp_loader(rank, world_size, batch_size=4):
-    # train_set = SWAGDataset(swag["train"].select(range(100)), tokenizer)
-    # valid_set = SWAGDataset(swag["validation"].select(range(10)), tokenizer)
-    # test_set = SWAGDataset(swag["test"].select(range(10)), tokenizer)
-    train_set = SWAGDataset(swag["train"], tokenizer)
-    valid_set = SWAGDataset(swag["validation"], tokenizer)
-    test_set = SWAGDataset(swag["test"], tokenizer)
+def get_ddp_loader(rank, world_size, batch_size):
+    train_set = SWAGDataset(swag["train"].select(range(100)), tokenizer)
+    valid_set = SWAGDataset(swag["validation"].select(range(10)), tokenizer)
+    test_set = SWAGDataset(swag["test"].select(range(10)), tokenizer)
+    # train_set = SWAGDataset(swag["train"], tokenizer)
+    # valid_set = SWAGDataset(swag["validation"], tokenizer)
+    # test_set = SWAGDataset(swag["test"], tokenizer)
     
     train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     valid_sampler = DistributedSampler(valid_set, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
@@ -190,17 +193,18 @@ def epoch_time(start_time, end_time):
     elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
     return elapsed_mins, elapsed_secs
 
-def main(rank, world_size):
+def main(rank, args):
+    world_size = args.gpus
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     #####
-    dataloader = get_ddp_loader(rank, world_size)
+    dataloader = get_ddp_loader(rank, world_size, args.batch_size)
     model = AutoModelForMultipleChoice.from_pretrained(MODEL_NAME).to(rank)
     model = DDP(model, device_ids=[rank], output_device=rank)
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=1e-5, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.lr)
     
     print(f"Rank {rank} is using GPU: {torch.cuda.get_device_name(rank)}")
     
-    NUM_EPOCHS = 3
+    NUM_EPOCHS = args.num_epochs
     best_valid_loss = float('inf')
     train_losses = []
     valid_losses = []
@@ -249,8 +253,27 @@ def main(rank, world_size):
 
 
 if __name__ == '__main__':
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-n', '--nodes', default=1,
+                        type=int, metavar='N')
+    parser.add_argument('-g', '--gpus', default=1, type=int,
+                        help='number of gpus per node')
+    parser.add_argument('-nr', '--nr', default=0, type=int,
+                        help='ranking within the nodes')
+    parser.add_argument('-a', '--ipaddr', default='localhost', type=str, 
+                        help='IP address of the main node')
+    parser.add_argument('-p', '--port', default='12355', type=str, 
+                        help='Port main node')
+    parser.add_argument('--batch_size', default=16, type=int, 
+                        help='batch size for train, valid and test splits')
+    parser.add_argument('--num_epochs', default=5, type=int, 
+                        help='Number of training epochs')
+    parser.add_argument('--lr', default=1e-5, type=int, 
+                        help='Learning rate for AdamW optimizer')
+    
+    args = parser.parse_args()
+    os.environ['MASTER_ADDR'] = args.ipaddr
+    os.environ['MASTER_PORT'] = args.port
     
     world_size = 2
-    mp.spawn(main, args=[world_size], nprocs=world_size)
+    mp.spawn(main, args=(args,), nprocs=args.gpus)
