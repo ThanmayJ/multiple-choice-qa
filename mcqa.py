@@ -275,5 +275,4 @@ if __name__ == '__main__':
     os.environ['MASTER_ADDR'] = args.ipaddr
     os.environ['MASTER_PORT'] = args.port
     
-    world_size = 2
     mp.spawn(main, args=(args,), nprocs=args.gpus)
