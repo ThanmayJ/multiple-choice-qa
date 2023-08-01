@@ -1,6 +1,6 @@
 # multiple-choice-qa
 
- This project was intended to familiarize myself with PyTorch DistributedDataParallel (DDP) training.
+ This project was intended to familiarize myself with PyTorch DistributedDataParallel (DDP) training with two GPUs on a single node.
 
 ## Dataset(s) used
 * [SWAG](https://arxiv.org/abs/1808.05326)
