@@ -28,6 +28,7 @@ Note: Due to compute limitations the models were trained with an effective effec
 * Maximum batch size (per GPU) that was obtainable using FSDP: 4
 
 ## References
+* [PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel](https://arxiv.org/abs/2304.11277)
 * [Advanced Model Training with Fully Sharded Data Parallel - PyTorch](https://pytorch.org/tutorials/intermediate/FSDP_adavnced_tutorial.html)
 * [Getting Started with Fully Sharded Data Parallel - PyTorch](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html)
 * [A Comprehensive Tutorial to Pytorch DistributedDataParallel - Medium](https://medium.com/codex/a-comprehensive-tutorial-to-pytorch-distributeddataparallel-1f4b42bb1b51)
