@@ -95,7 +95,7 @@ def get_ddp_loader(rank, world_size, batch_size, model_type):
     train_set = SWAGDataset(swag["train"], tokenizer)
     valid_set = SWAGDataset(swag["validation"], tokenizer)
     test_set = SWAGDataset(swag["test"], tokenizer)
-    
+
     train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     valid_sampler = DistributedSampler(valid_set, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     test_sampler = DistributedSampler(test_set, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
@@ -106,6 +106,13 @@ def get_ddp_loader(rank, world_size, batch_size, model_type):
     
     dataloader = {"train":train_loader, "valid":valid_loader, "test":test_loader}
     return dataloader
+
+g_gigabyte = 1024**3
+def format_metrics_to_gb(item):
+    """quick function to format numbers to gigabyte and round to 4 digit precision"""
+    metric_num = item / g_gigabyte
+    metric_num = round(metric_num, ndigits=4)
+    return metric_num
 
 CELoss = torch.nn.CrossEntropyLoss()
 
@@ -279,8 +286,9 @@ def main(rank, args):
             )
         model = FSDP(model,auto_wrap_policy=roberta_auto_wrap_policy,device_id=rank, sharding_strategy = ShardingStrategy.FULL_SHARD)
         if args.gpus == 1:
+            # Single GPU defaults to NO_SHARD ShardingStrategy, which doesn't work with CPU Offloading, so set offload_to_cpu=False
             fsdp_save_policy = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
-        if else:
+        else:
             fsdp_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     else:
         model = DDP(model, device_ids=[rank], output_device=rank)
@@ -294,6 +302,8 @@ def main(rank, args):
     train_losses = []
     valid_losses = []
     train_start = time.time()
+    mem_alloc_tracker = []
+    mem_reserved_tracker = []
     for epoch in range(0, NUM_EPOCHS, 1):
         start_time = time.time()
         if(rank==0):
@@ -309,6 +319,8 @@ def main(rank, args):
         valid_losses.append(valid_loss)
         if rank==0:
             print(f"[Epoch {epoch}] Time: {epoch_mins}m {epoch_secs}s | Train Loss {train_loss} | Valid Loss {valid_loss} \n")
+            mem_alloc_tracker.append(format_metrics_to_gb(torch.cuda.memory_allocated()))
+            mem_reserved_tracker.append(format_metrics_to_gb(torch.cuda.memory_reserved()))
         
         if args.use_fsdp:
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_save_policy):
@@ -349,6 +361,8 @@ def main(rank, args):
     if rank==0:
         print(f"Accuracy: {accuracy} | Test Loss: {test_loss}")
         print(f"Training time took {train_mins}m {train_secs}s")
+        print(f"Total memory allocated: {sum(mem_alloc_tracker)/len(mem_alloc_tracker)}")
+        print(f"Total memory reserved: {sum(mem_reserved_tracker)/len(mem_alloc_tracker)}")
     dist.barrier()
     dist.destroy_process_group()
 
@@ -375,7 +389,7 @@ if __name__ == '__main__':
                         help='Type of MCQA model: MultipleChoice or SequenceClassification')
     parser.add_argument('--use_fsdp', default=False, type=bool, 
                         help='Use FSDP training if True, else DDP')
-    
+
     args = parser.parse_args()
     os.environ['MASTER_ADDR'] = args.ipaddr
     os.environ['MASTER_PORT'] = args.port
