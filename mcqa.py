@@ -1,5 +1,7 @@
 import os
+import sys
 import argparse
+import functools
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 
@@ -17,13 +19,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
+from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP, ShardingStrategy, FullStateDictConfig, LocalStateDictConfig, StateDictType
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from transformers.models.roberta.modeling_roberta import RobertaLayer
+
 MODEL_NAME = "roberta-base"
 MODEL_PATH = f"models/{MODEL_NAME} "
 TOKENIZER_PATH = f"tokenizers/{MODEL_NAME}"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-device = 'cuda'
 
 swag = load_dataset("swag", "regular")
 
@@ -105,11 +107,11 @@ def get_ddp_loader(rank, world_size, batch_size, model_type):
     dataloader = {"train":train_loader, "valid":valid_loader, "test":test_loader}
     return dataloader
 
-TEAMLoss = torch.nn.CrossEntropyLoss()
+CELoss = torch.nn.CrossEntropyLoss()
 
-def train(rank, epoch, tokenizer, model, device, loader, optimizer, model_type):
+def train(rank, epoch, tokenizer, model, loader, optimizer, model_type):
     model.train()
-    epoch_loss = 0
+    epoch_loss = torch.zeros(2).to(rank)
     loader.sampler.set_epoch(epoch)    
     for _, data in enumerate(loader):
         optimizer.zero_grad()
@@ -122,20 +124,22 @@ def train(rank, epoch, tokenizer, model, device, loader, optimizer, model_type):
             loss = outputs[0]
         else:
             outputs = model(input_ids=src,attention_mask=mask)
-            loss = TEAMLoss(outputs.logits, label)
+            loss = CELoss(outputs.logits, label)
 
         if _ % 10 == 0 and rank==0:
             print(f"Epoch {epoch} | Step {_} | Loss {loss}")
 
         loss.backward()
         optimizer.step()
-        epoch_loss += loss
-    return epoch_loss/len(loader)
+        epoch_loss += torch.tensor([loss.item(), src.shape[0]]).to(rank) 
+    
+    dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
+    return epoch_loss[0] / epoch_loss[1]
 
 
-def validate(rank, epoch, tokenizer, model, device, loader, model_type):
+def validate(rank, epoch, tokenizer, model, loader, model_type):
     model.eval()
-    epoch_loss = 0
+    epoch_loss = torch.zeros(2).to(rank)
     loader.sampler.set_epoch(epoch)    
     with torch.no_grad():
         for _, data in enumerate(loader):
@@ -150,13 +154,15 @@ def validate(rank, epoch, tokenizer, model, device, loader, model_type):
                 loss = outputs[0]
             else:
                 outputs = model(input_ids=src,attention_mask=mask)
-                loss = TEAMLoss(outputs.logits, label)
+                loss = CELoss(outputs.logits, label)
 
             if _ % 10 == 0 and rank==0:
                 print(f"Epoch {epoch} | Step {_} | Loss {loss}")
 
-            epoch_loss += loss
-    return epoch_loss/len(loader)
+            epoch_loss += torch.tensor([loss.item(), src.shape[0]]).to(rank) 
+    
+    dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
+    return epoch_loss[0] / epoch_loss[1]
 
 
 def do_gather(rank, world_size, data):
@@ -170,9 +176,9 @@ def do_gather(rank, world_size, data):
         return []
 
 
-def test(rank, world_size, epoch, tokenizer, model, device, loader, model_type):
+def test(rank, world_size, epoch, tokenizer, model, loader, model_type):
     model.eval()
-    epoch_loss = 0
+    epoch_loss = torch.zeros(2).to(rank)
     references = []
     predictions = []
     loader.sampler.set_epoch(epoch)    
@@ -195,7 +201,7 @@ def test(rank, world_size, epoch, tokenizer, model, device, loader, model_type):
             else:
                 outputs = model(input_ids=src,attention_mask=mask)
                 logits = outputs.logits
-                loss = TEAMLoss(logits, label)
+                loss = CELoss(logits, label)
 
                 positive_score = logits[:, 1]
                 print(positive_score.shape)
@@ -208,7 +214,10 @@ def test(rank, world_size, epoch, tokenizer, model, device, loader, model_type):
             if _ % 10 == 0 and rank==0:
                 print(f"Epoch {epoch} | Step {_} | Loss {loss}")
 
-            epoch_loss += loss
+            epoch_loss += torch.tensor([loss.item(), src.shape[0]]).to(rank) 
+    
+    dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
+
     
     # print(f"Rank {rank} has {len(predictions)} predictions and {len(references)} references")
     predictions = torch.tensor(predictions,dtype=torch.int8).to(rank)
@@ -238,7 +247,7 @@ def test(rank, world_size, epoch, tokenizer, model, device, loader, model_type):
     # if(rank==0):
     #     print(f"After gathering, we have in total {len(predictions_list)} predictions and {len(references_list)} references")
 
-    return accuracy, epoch_loss/len(loader)
+    return accuracy, epoch_loss[0] / epoch_loss[1]
 
 
 def epoch_time(start_time, end_time):
@@ -252,17 +261,35 @@ def main(rank, args):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     #####
     dataloader = get_ddp_loader(rank, world_size, args.batch_size, args.model_type)
+
+    torch.cuda.set_device(rank)
+
     if args.model_type=="MultipleChoice":
         model = AutoModelForMultipleChoice.from_pretrained(MODEL_NAME).to(rank)
     else:
         model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME,num_labels=2).to(rank)
-    
-    model = DDP(model, device_ids=[rank], output_device=rank)
+
+    # model is on CPU before input to FSDP
+    if args.use_fsdp:
+        roberta_auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={
+                RobertaLayer,
+                },
+            )
+        model = FSDP(model,auto_wrap_policy=roberta_auto_wrap_policy,device_id=rank, sharding_strategy = ShardingStrategy.FULL_SHARD)
+        if args.gpus == 1:
+            fsdp_save_policy = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
+        if else:
+            fsdp_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    else:
+        model = DDP(model, device_ids=[rank], output_device=rank)
+        
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.lr)
     
     print(f"Rank {rank} is using GPU: {torch.cuda.get_device_name(rank)}")
     
-    NUM_EPOCHS = args.num_epochs
+    NUM_EPOCHS = args.epochs
     best_valid_loss = float('inf')
     train_losses = []
     valid_losses = []
@@ -271,11 +298,11 @@ def main(rank, args):
         start_time = time.time()
         if(rank==0):
             print("\nTraining...")
-        train_loss = train(rank, epoch, tokenizer, model, device, dataloader["train"], optimizer, args.model_type)
+        train_loss = train(rank, epoch, tokenizer, model, dataloader["train"], optimizer, args.model_type)
         end_time = time.time()
         if(rank==0):
             print("\nValidating...")
-        valid_loss = validate(rank, epoch, tokenizer, model, device, dataloader["valid"], args.model_type)
+        valid_loss = validate(rank, epoch, tokenizer, model, dataloader["valid"], args.model_type)
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
 
         train_losses.append(train_loss)
@@ -283,11 +310,19 @@ def main(rank, args):
         if rank==0:
             print(f"[Epoch {epoch}] Time: {epoch_mins}m {epoch_secs}s | Train Loss {train_loss} | Valid Loss {valid_loss} \n")
         
-        if valid_loss < best_valid_loss and rank==0:
-            print(f"[Saving Model]")
+        if args.use_fsdp:
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_save_policy):
+                checkpoint_dict = {'model':model.state_dict(), 'optimizer':optimizer.state_dict()}
+        else:
             checkpoint_dict = {'model':model.state_dict(), 'optimizer':optimizer.state_dict()}
-            torch.save(checkpoint_dict, MODEL_PATH)
-            # model.module.save_pretrained(MODEL_PATH)
+        
+        if rank==0 and valid_loss < best_valid_loss:
+            print(f"[Saving Model]")
+            if args.use_fsdp:
+                torch.save(checkpoint_dict, MODEL_PATH+"_fsdp")
+            else:
+                torch.save(checkpoint_dict, MODEL_PATH)
+                #model.module.save_pretrained(MODEL_PATH)
             tokenizer.save_pretrained(TOKENIZER_PATH)
             best_valid_loss = valid_loss
 
@@ -297,11 +332,20 @@ def main(rank, args):
         print("\nTesting...")
         print(f"[Loading Model with Best Validation Loss]")
     dist.barrier() # Better to do this before loading the model to avoid PytorchStreamReader errors
-    map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
-    checkpoint_dict = torch.load(MODEL_PATH, map_location=map_location)
-    model.load_state_dict(checkpoint_dict['model'])
-    optimizer.load_state_dict(checkpoint_dict['optimizer'])
-    accuracy, test_loss = test(rank, world_size, epoch, tokenizer, model, device, dataloader["valid"], args.model_type)
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.lr)
+    if args.use_fsdp:
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_save_policy):
+            checkpoint_dict = torch.load(MODEL_PATH+"_fsdp")
+        model.load_state_dict(checkpoint_dict['model'])
+        optimizer.load_state_dict(checkpoint_dict['optimizer'])
+
+    else:
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+        checkpoint_dict = torch.load(MODEL_PATH, map_location=map_location)
+        model.load_state_dict(checkpoint_dict['model'])
+        optimizer.load_state_dict(checkpoint_dict['optimizer'])
+
+    accuracy, test_loss = test(rank, world_size, epoch, tokenizer, model, dataloader["valid"], args.model_type)
     if rank==0:
         print(f"Accuracy: {accuracy} | Test Loss: {test_loss}")
         print(f"Training time took {train_mins}m {train_secs}s")
@@ -323,12 +367,14 @@ if __name__ == '__main__':
                         help='Port main node')
     parser.add_argument('--batch_size', default=16, type=int, 
                         help='batch size for train, valid and test splits')
-    parser.add_argument('--num_epochs', default=5, type=int, 
+    parser.add_argument('--epochs', default=5, type=int, 
                         help='Number of training epochs')
     parser.add_argument('--lr', default=1e-5, type=int, 
                         help='Learning rate for AdamW optimizer')
-    parser.add_argument('--model_type', default="MultipleChoice",type=str,
+    parser.add_argument('--model_type', default="MultipleChoice",type=str, choices=['MultipleChoice', 'SequenceClassification'],
                         help='Type of MCQA model: MultipleChoice or SequenceClassification')
+    parser.add_argument('--use_fsdp', default=False, type=bool, 
+                        help='Use FSDP training if True, else DDP')
     
     args = parser.parse_args()
     os.environ['MASTER_ADDR'] = args.ipaddr
