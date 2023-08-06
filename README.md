@@ -1,6 +1,4 @@
-# multiple-choice-qa
-
- This project was intended to familiarize myself with PyTorch DistributedDataParallel (DDP) and FullyShardedDataParallel (FSDP) training. I've tested it with two GPUs on a single node.
+This project was intended to familiarize myself with PyTorch DistributedDataParallel (DDP) and FullyShardedDataParallel (FSDP) training. I've tested it with two GPUs on a single node.
 
 ## Task
 **Multiple Choice Question Answering:** Given a question, classify the answer from a given set of possible answers.
@@ -23,11 +21,11 @@ Results are reported on the model having best valid loss across epochs:
 
 Note: Due to compute limitations the models were trained with an effective effective batch size of 8 and training time per epoch was 150 minutes. Hence, we can expect much better results on training for more epochs. 
 
-Maximum batch size (per GPU) that was obtainable using DDP: 2
-Maximum batch size (per GPU) that was obtainable using FSDP: 4
-
 ## Memory Usage
-![](https://github.com/ThanmayJ/multiple-choice-qa/blob/main/plot.png)
+![](./plot.png)
+
+* Maximum batch size (per GPU) that was obtainable using DDP: 2
+* Maximum batch size (per GPU) that was obtainable using FSDP: 4
 
 ## References
 * [Advanced Model Training with Fully Sharded Data Parallel - PyTorch](https://pytorch.org/tutorials/intermediate/FSDP_adavnced_tutorial.html)
@@ -37,5 +35,3 @@ Maximum batch size (per GPU) that was obtainable using FSDP: 4
 * [https://pytorch.org/docs/stable/fsdp.html](https://pytorch.org/docs/stable/fsdp.html)
 * [https://pytorch.org/docs/stable/distributed.html](https://pytorch.org/docs/stable/distributed.html)
 * [Two is Better than Many? Binary Classification as an Effective Approach to Multi-Choice Question Answering](https://arxiv.org/abs/2210.16495)
-
- 
