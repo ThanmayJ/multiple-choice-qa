@@ -21,7 +21,13 @@ Results are reported on the model having best valid loss across epochs:
 * Accuracy using RoBERTaSequenceClassification: 85.60 %
 * Accuracy using RoBERTaMultipleChoice: 83.63 %
 
-Note: Due to compute limitations the models effective batch size of 32 and training time per epoch took 150 minutes. Hence, we can expect much better results on training for more epochs.
+Note: Due to compute limitations the models were trained with an effective effective batch size of 8 and training time per epoch was 150 minutes. Hence, we can expect much better results on training for more epochs. 
+
+Maximum batch size (per GPU) that was obtainable using DDP: 2
+Maximum batch size (per GPU) that was obtainable using FSDP: 4
+
+## Memory Usage
+![](https://github.com/ThanmayJ/multiple-choice-qa/blob/main/plot.png)
 
 ## References
 * [Advanced Model Training with Fully Sharded Data Parallel - PyTorch](https://pytorch.org/tutorials/intermediate/FSDP_adavnced_tutorial.html)
