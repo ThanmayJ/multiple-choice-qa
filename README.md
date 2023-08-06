@@ -3,7 +3,7 @@
  This project was intended to familiarize myself with PyTorch DistributedDataParallel (DDP) and FullyShardedDataParallel (FSDP) training. I've tested it with two GPUs on a single node.
 
 ## Task
-Multiple Choice Question Answering: Given a question, classify the answer from a given set of possible answers.
+**Multiple Choice Question Answering:** Given a question, classify the answer from a given set of possible answers.
 
 ## Dataset(s) used
 * [SWAG](https://arxiv.org/abs/1808.05326)
